@@ -4,6 +4,8 @@ import pathlib
 import argparse
 from gymnasium import wrappers
 import numpy as np
+import time
+import os
 
 import torch
 import torch.optim as optim
@@ -31,6 +33,51 @@ REPLAY_INITIAL = 10000
 REWARD_STEPS = 2
 LEARNING_RATE = 0.0001
 STATES_TO_EVALUATE = 1000
+CHECKPOINT_EVERY = 50000  # Salva un checkpoint ogni 50k iterazioni
+
+
+def save_checkpoint(engine, path, net, tgt_net, selector, buffer, optimizer, eps_tracker):
+    """Salva un checkpoint completo dell'addestramento"""
+    checkpoint = {
+        'iteration': engine.state.iteration,
+        'net_state_dict': net.state_dict(),
+        'tgt_net_state_dict': tgt_net.target_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epsilon': selector.epsilon,
+        'best_mean_val': getattr(engine.state, "best_mean_val", None),
+        'best_val_reward': getattr(engine.state, "best_val_reward", None),
+        'buffer': buffer.buffer if hasattr(buffer, 'buffer') else None,
+        'timestamp': time.time()
+    }
+    
+    torch.save(checkpoint, path)
+    print(f"Checkpoint salvato in {path}")
+
+
+def load_checkpoint(path, net, tgt_net, selector, buffer, optimizer):
+    """Carica un checkpoint salvato"""
+    if not os.path.exists(path):
+        print(f"Il checkpoint {path} non esiste.")
+        return None
+    
+    checkpoint = torch.load(path)
+    
+    # Carica i parametri del modello
+    net.load_state_dict(checkpoint['net_state_dict'])
+    tgt_net.target_model.load_state_dict(checkpoint['tgt_net_state_dict'])
+    
+    # Carica lo stato dell'ottimizzatore
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Imposta epsilon
+    selector.epsilon = checkpoint['epsilon']
+    
+    # Carica il buffer di replay se disponibile
+    if checkpoint['buffer'] is not None and hasattr(buffer, 'buffer'):
+        buffer.buffer = checkpoint['buffer']
+    
+    print(f"Checkpoint caricato da {path}, iterazione {checkpoint['iteration']}")
+    return checkpoint
 
 
 if __name__ == "__main__":
@@ -40,6 +87,7 @@ if __name__ == "__main__":
     parser.add_argument("--year", type=int, help="Year to train on, overrides --data")
     parser.add_argument("--val", default=VAL_STOCKS, help="Validation data, default=" + VAL_STOCKS)
     parser.add_argument("-r", "--run", required=True, help="Run name")
+    parser.add_argument("--checkpoint", help="Path to checkpoint file to riprendere l'addestramento")
     args = parser.parse_args()
     device = torch.device(args.dev)
 
@@ -84,6 +132,7 @@ if __name__ == "__main__":
         exp_source, REPLAY_SIZE)
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
 
+    # Definizione della nostra funzione di processo batch
     def process_batch(engine, batch):
         optimizer.zero_grad()
         loss_v = common.calc_loss(
@@ -107,6 +156,19 @@ if __name__ == "__main__":
     engine = Engine(process_batch)
     tb = common.setup_ignite(engine, exp_source, f"simple-{args.run}",
                              extra_metrics=('values_mean',))
+
+    # Se è specificato un checkpoint, caricalo
+    start_iteration = 0
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint if os.path.exists(args.checkpoint) else saves_path / args.checkpoint
+        checkpoint = load_checkpoint(checkpoint_path, net, tgt_net, selector, buffer, optimizer)
+        if checkpoint:
+            start_iteration = checkpoint['iteration']
+            engine.state.iteration = start_iteration
+            if 'best_mean_val' in checkpoint:
+                engine.state.best_mean_val = checkpoint['best_mean_val']
+            if 'best_val_reward' in checkpoint:
+                engine.state.best_val_reward = checkpoint['best_val_reward']
 
     @engine.on(ptan.ignite.PeriodEvents.ITERS_1000_COMPLETED)
     def sync_eval(engine: Engine):
@@ -146,6 +208,14 @@ if __name__ == "__main__":
             path = saves_path / ("val_reward-%.3f.data" % val_reward)
             torch.save(net.state_dict(), path)
 
+    # Aggiungiamo un evento periodico per salvare un checkpoint completo
+    @engine.on(ptan.ignite.PeriodEvents.ITERATION_COMPLETED)
+    def maybe_save_checkpoint(engine: Engine):
+        iteration = engine.state.iteration
+        if iteration % CHECKPOINT_EVERY == 0:
+            checkpoint_path = saves_path / f"checkpoint-{iteration}.pth"
+            save_checkpoint(engine, checkpoint_path, net, tgt_net, selector, buffer, optimizer, eps_tracker)
+
     event = ptan.ignite.PeriodEvents.ITERS_10000_COMPLETED
     tst_metrics = [m + "_tst" for m in validation.METRICS]
     tst_handler = tb_logger.OutputHandler(
@@ -157,4 +227,12 @@ if __name__ == "__main__":
         tag="validation", metric_names=val_metrics)
     tb.attach(engine, log_handler=val_handler, event_name=event)
 
+    # Se stiamo riprendendo da un checkpoint e il buffer non era nel checkpoint
+    # assicuriamoci di riempirlo prima di iniziare l'addestramento
+    if args.checkpoint and start_iteration > 0 and not buffer.buffer:
+        print("Riempimento del buffer di replay...")
+        for _ in range(REPLAY_INITIAL):
+            buffer.populate(1)
+
+    # Avvio dell'addestramento
     engine.run(common.batch_generator(buffer, REPLAY_INITIAL, BATCH_SIZE))
